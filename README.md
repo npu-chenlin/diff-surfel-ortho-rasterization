@@ -1,6 +1,12 @@
 # Differential Surfel Rasterization
 
-This is the rasterization engine for the paper "2D Gaussian Splatting for  Geometrically Accurate Radiance Fields". If you can make use of it in your own research, please be so kind to cite us.
+This is the rasterization engine for the paper "2D Gaussian Splatting for Geometrically Accurate Radiance Fields". It has been extended to support **Orthographic Projection**.
+
+## Orthographic Projection Support
+
+This repository now supports orthographic projection.
+
+If you make use of this work in your own research, please be so kind to cite the original authors:
 
 <section class="section" id="BibTeX">
   <div class="container is-max-desktop content">
@@ -20,7 +26,7 @@ This is the rasterization engine for the paper "2D Gaussian Splatting for  Geome
   <div class="container is-max-desktop content">
     <h2 class="title">BibTeX</h2>
     <pre><code>@Article{kerbl3Dgaussians,
-      author       = {Kerbl, Bernhard and Kopanas, Georgios and Leimk{\"u}hler, Thomas and Drettakis, George},
+      author       = {Kerbl, Bernhard and Kopanas, Georgios and Leimk{"u}hler, Thomas and Drettakis, George},
       title        = {3D Gaussian Splatting for Real-Time Radiance Field Rendering},
       journal      = {ACM Transactions on Graphics},
       number       = {4},
