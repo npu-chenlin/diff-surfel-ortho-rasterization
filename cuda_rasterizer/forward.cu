@@ -80,14 +80,25 @@ __device__ void compute_transmat(
 	const float* projmatrix,
 	const float* viewmatrix,
 	const int W,
-	const int H, 
+	const int H,
 	glm::mat3 &T,
-	float3 &normal
+	float3 &normal,
+	bool ortho,
+	float3* depth_coefs,
+	float p_view_z
 ) {
 
 	glm::mat3 R = quat_to_rotmat(rot);
 	glm::mat3 S = scale_to_mat(scale, mod);
 	glm::mat3 L = R * S;
+
+	if (depth_coefs) {
+		float3 L0 = {L[0][0], L[0][1], L[0][2]};
+		float3 L1 = {L[1][0], L[1][1], L[1][2]};
+		float3 L0_view = transformVec4x3(L0, viewmatrix);
+		float3 L1_view = transformVec4x3(L1, viewmatrix);
+		*depth_coefs = {L0_view.z, L1_view.z, p_view_z};
+	}
 
 	// center of Gaussians in the camera coordinate
 	glm::mat3x4 splat2world = glm::mat3x4(
@@ -117,7 +128,7 @@ __device__ void compute_transmat(
 // Computing the bounding box of the 2D Gaussian and its center
 // The center of the bounding box is used to create a low pass filter
 __device__ bool compute_aabb(
-	glm::mat3 T, 
+	glm::mat3 T,
 	float cutoff,
 	float2& point_image,
 	float2& extent
@@ -132,7 +143,7 @@ __device__ bool compute_aabb(
 		glm::dot(f, T[1] * T[2])
 	);
 
-	glm::vec2 h0 = p * p - 
+	glm::vec2 h0 = p * p -
 		glm::vec2(
 			glm::dot(f, T[0] * T[0]),
 			glm::dot(f, T[1] * T[1])
@@ -166,11 +177,13 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float2* points_xy_image,
 	float* depths,
 	float* transMats,
+	float* depth_planes,
 	float* rgb,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	bool ortho)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -189,17 +202,22 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// Compute transformation matrix
 	glm::mat3 T;
 	float3 normal;
+	float3 depth_coefs;
 	if (transMat_precomp == nullptr)
 	{
-		compute_transmat(((float3*)orig_points)[idx], scales[idx], scale_modifier, rotations[idx], projmatrix, viewmatrix, W, H, T, normal);
+		compute_transmat(((float3*)orig_points)[idx], scales[idx], scale_modifier, rotations[idx], projmatrix, viewmatrix, W, H, T, normal, ortho, &depth_coefs, p_view.z);
 		float3 *T_ptr = (float3*)transMats;
 		T_ptr[idx * 3 + 0] = {T[0][0], T[0][1], T[0][2]};
 		T_ptr[idx * 3 + 1] = {T[1][0], T[1][1], T[1][2]};
 		T_ptr[idx * 3 + 2] = {T[2][0], T[2][1], T[2][2]};
+
+		if (depth_planes) {
+			((float3*)depth_planes)[idx] = depth_coefs;
+		}
 	} else {
 		glm::vec3 *T_ptr = (glm::vec3*)transMat_precomp;
 		T = glm::mat3(
-			T_ptr[idx * 3 + 0], 
+			T_ptr[idx * 3 + 0],
 			T_ptr[idx * 3 + 1],
 			T_ptr[idx * 3 + 2]
 		);
@@ -251,7 +269,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 }
 
 // Main rasterization method. Collaboratively works on one tile per
-// block, each thread treats one pixel. Alternates between fetching 
+// block, each thread treats one pixel. Alternates between fetching
 // and rasterizing data.
 template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -263,13 +281,15 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ transMats,
+	const float* __restrict__ depth_planes,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_others)
+	float* __restrict__ out_others,
+	bool ortho)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -297,6 +317,7 @@ renderCUDA(
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
+	__shared__ float3 collected_depth_planes[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
@@ -337,6 +358,9 @@ renderCUDA(
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
+			if (ortho && depth_planes) {
+				collected_depth_planes[block.thread_rank()] = {depth_planes[3 * coll_id], depth_planes[3 * coll_id+1], depth_planes[3 * coll_id+2]};
+			}
 		}
 		block.sync();
 
@@ -366,9 +390,16 @@ renderCUDA(
 			float rho = min(rho3d, rho2d);
 
 			// compute depth
-			float depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
+			float depth;
+			if (ortho) {
+				float3 dp = collected_depth_planes[j];
+				depth = s.x * dp.x + s.y * dp.y + dp.z;
+			} else {
+				depth = (s.x * Tw.x + s.y * Tw.y) + Tw.z;
+			}
+			
 			// if a point is too small, its depth is not reliable?
-			// depth = (rho3d <= rho2d) ? depth : Tw.z 
+			// depth = (rho3d <= rho2d) ? depth : Tw.z
 			if (depth < near_n) continue;
 
 			float4 nor_o = collected_normal_opacity[j];
@@ -456,13 +487,15 @@ void FORWARD::render(
 	const float2* means2D,
 	const float* colors,
 	const float* transMats,
+	const float* depth_planes,
 	const float* depths,
 	const float4* normal_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_others)
+	float* out_others,
+	bool ortho)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -472,13 +505,15 @@ void FORWARD::render(
 		means2D,
 		colors,
 		transMats,
+		depth_planes,
 		depths,
 		normal_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
 		out_color,
-		out_others);
+		out_others,
+		ortho);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -501,11 +536,13 @@ void FORWARD::preprocess(int P, int D, int M,
 	float2* means2D,
 	float* depths,
 	float* transMats,
+	float* depth_planes,
 	float* rgb,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	bool ortho)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -518,7 +555,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		clamped,
 		transMat_precomp,
 		colors_precomp,
-		viewmatrix, 
+		viewmatrix,
 		projmatrix,
 		cam_pos,
 		W, H,
@@ -528,10 +565,12 @@ void FORWARD::preprocess(int P, int D, int M,
 		means2D,
 		depths,
 		transMats,
+		depth_planes,
 		rgb,
 		normal_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		ortho
 		);
 }

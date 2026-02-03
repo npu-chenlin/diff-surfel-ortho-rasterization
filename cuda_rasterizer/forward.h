@@ -43,11 +43,13 @@ namespace FORWARD
 		// float* isovals,
 		// float3* normals,
 		float* transMats,
+		float* depth_planes,
 		float* colors,
 		float4* normal_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		bool ortho);
 
 	// Main rasterization method.
 	void render(
@@ -59,13 +61,15 @@ namespace FORWARD
 		const float2* points_xy_image,
 		const float* features,
 		const float* transMats,
+		const float* depth_planes,
 		const float* depths,
 		const float4* normal_opacity,
 		float* final_T,
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color,
-		float* out_others);
+		float* out_others,
+		bool ortho);
 }
 
 
